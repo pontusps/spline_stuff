@@ -1,0 +1,407 @@
+---
+title: "Cimbi36 spline fit of reference-region"
+author: "PPS"
+date: "20/07/2020"
+output: html_document
+---
+
+## Setup
+
+```{r setup, echo=F, warning=F,message=F} 
+
+#knitr::opts_chunk$set(echo = FALSE) #'echo = False' hides *all* code chunks below when knitted 
+knitr::opts_chunk$set(warning = FALSE) #'warning = F' hides *all* warnings messages below when knitted 
+knitr::opts_chunk$set(message = FALSE) #'message = F' hides *all* messages below when knitted 
+
+#set path to the parent folder of the project
+knitr::opts_knit$set(root.dir = normalizePath("/Users/pontus.sigray/Documents/NRU/Bootstrapper"))
+
+#load packages (install from CRAN unless otherwise specified)
+library(kinfitr) #devtools::install_github('mathesong/kinfitr')
+library(tidyverse)
+library(knitr)
+library(kableExtra)
+library(mgcv)
+library(ggforce)
+library(furrr)
+library(ggplot2)
+library(magrittr)
+
+#Graphics theme
+theme_set(theme_light())
+
+
+```
+
+## Fetch all data
+
+```{r}
+
+#fetch all ROI TACs and blood files
+source('./R/cimbi36_TAC_analysis/Prep/fetch_ROITAC_and_Blood_Data_TrT.R')
+
+path.PET1 <- './RawData/cimbi36_TrT/Test/'
+path.PET2 <- './RawData/cimbi36_TrT/Retest/'
+
+PET1.data <- fetch_ROITAC_and_Blood_Data_TrT(path = path.PET1,PETNo = 1)
+PET2.data <- fetch_ROITAC_and_Blood_Data_TrT(path = path.PET2,PETNo = 2)
+
+alldat <- dplyr::bind_rows(PET1.data,PET2.data)
+
+#fetch database overview
+
+db.df <- xlsx::read.xlsx(file = './RawData/cimbi36_Database_overview/cimbi36_HC_Database_overview.xlsx',sheetIndex = 1)
+db.df <- select(db.df,c(CIMBI.ID,Cimbi.36.ID))
+
+alldat <- dplyr::left_join(alldat,db.df,by = c("Subjname"="Cimbi.36.ID"))
+
+alldat$PET <- paste0(alldat$CIMBI.ID,'_',alldat$PETNo)
+
+alldat <- select(alldat,c(PET,CIMBI.ID,PETNo,Subjname,tacs,blooddata))
+
+```
+
+
+# Add gaussian noise to cerebellum data
+```{r}
+
+add.noise <- function(tacs.inp){
+  tacs.inp$Total_cb.noise <- tacs.inp$Total_cb + rnorm(n = length( tacs.inp$Total_cb), mean = 0,sd = 1)
+  
+  tacs.inp$Total_cb.noise[tacs.inp$Total_cb.noise<0] <- 0
+  
+  return(tacs.inp)
+}
+
+
+alldat <- alldat %>%
+  mutate( tacs = map(.x = tacs,.f = add.noise))
+
+
+```
+
+
+# Fit spline to Cerebellum
+
+```{r}
+
+
+splinefit <- function(tacs){
+  
+  gam.fit <- mgcv::gam(formula = (Total_cb ~ s(Times , bs = 'cr', k = 14)),
+                       sp = 3,
+                       data = tacs)
+  
+  return(gam.fit)
+  
+}
+
+splinefit.noise <- function(tacs){
+  
+  gam.fit <- mgcv::gam(formula = (Total_cb.noise ~ s(Times , bs = 'cr', k = 30)),
+                       data = tacs)
+  
+  return(gam.fit)
+  
+}
+
+
+alldat <- alldat %>%
+  mutate( spline.fit = map(.x = tacs,.f = splinefit),
+          spline.fit.noise = map(.x = tacs,.f = splinefit.noise),)
+
+#Add fitted values to tacs
+add.spline.fit <- function(tacs.inp,spline.fit.inp){
+  
+  Total_cb.splinefit <- as.numeric(predict(spline.fit.inp))
+  Total_cb.splinefit[1] <- 0 #set first value to zero 
+  
+  tacs.inp$Total_cb.splinefit <- Total_cb.splinefit
+  
+  return(tacs.inp)
+  
+}
+
+#Add fitted values to tacs
+add.spline.fit.noise <- function(tacs.inp,spline.fit.inp){
+  
+  Total_cb.splinefit.noise <- as.numeric(predict(spline.fit.inp))
+  Total_cb.splinefit.noise[1] <- 0 #set first value to zero 
+  
+  tacs.inp$Total_cb.splinefit.noise <- Total_cb.splinefit.noise
+  
+  return(tacs.inp)
+  
+}
+
+alldat <- alldat %>%
+  mutate( tacs = purrr::map2(tacs,spline.fit, .f = add.spline.fit  ),
+          tacs = purrr::map2(tacs,spline.fit.noise, .f = add.spline.fit.noise  ))
+
+
+
+```
+
+#Plot cerebellum TACs and spline fits
+
+```{r,eval = F}
+plotTACs <- function(tacs, Subjname){
+  
+  plotTAC <- tacs %>%
+  select( c( Times,Total_cb.noise) ) %>% #select the Regions to model  
+  ggplot(aes(x=Times, y=Total_cb.noise)) +
+    geom_point() +
+    geom_line(data = tacs,aes(x = Times,y = Total_cb.splinefit.noise), col = 'red') +
+  labs(title=Subjname,
+       y="Radioactivity (kBq)",
+       x = "Time (min)")
+  
+}
+
+alldat <- alldat %>%
+  mutate(plotTACs = map2(.x = tacs,.y = Subjname, ~plotTACs(tacs = .x,Subjname = .y) ) )
+
+print(alldat$plotTACs)
+
+```
+
+## Create weights
+
+Since sqrt(duration) weights might be very off for alldat I'm going to use the build in generic weights function of kinfitr. 
+
+```{r}
+
+create_weights <- function(tacs){
+  
+  new_weights <- kinfitr::weights_create(t_start = c(tacs$Times - tacs$Duration/2),
+                          t_end = c(tacs$Times + tacs$Duration/2),
+                          tac = tacs$Temporal.Cortex,
+                          radioisotope = c("C11"),
+                          method = 2,
+                          minweight = 0.7)
+  
+  tacs$Weights <- new_weights
+  return(tacs)
+  
+}
+  
+alldat %<>%
+  mutate(tacs = purrr::pmap(.l = list(tacs),.f = create_weights))
+```
+
+
+## Make alldat into even longer nested format by spreading ROIs
+
+```{r}
+
+alldatLong <- alldat %>%
+  select(PET,Subjname, PETNo, tacs) %>%
+  unnest() %>%
+  gather(Region, TAC, -c(PET,Subjname, PETNo, Total_cb,Total_cb.noise, 
+                         Total_cb.splinefit,Total_cb.splinefit.noise,
+                         Times, Weights)) %>%
+  group_by(PET,Subjname, PETNo, Region) %>%
+  nest(.key = 'tacs') %>%
+  filter(Region != 'Duration')
+
+
+```
+
+#Fit SRTM
+
+```{r}
+
+
+alldatLong <- alldatLong %>%
+  filter(Region == c('Striatum') |
+           Region == c('Temporal.Cortex') |
+           Region == c('Frontal.Cortex'))
+
+#Make function for fitting  srtm using raw cer values
+srtm.cb <- function(tacs) {
+  kinfitr::srtm(t_tac = tacs$Times, 
+                reftac = tacs$Total_cb,
+                roitac = tacs$TAC, 
+                weights = tacs$Weights,
+                multstart_iter = 1) 
+}
+
+srtm.cb.noise <- function(tacs) {
+  kinfitr::srtm(t_tac = tacs$Times, 
+                reftac = tacs$Total_cb.noise,
+                roitac = tacs$TAC, 
+                weights = tacs$Weights,
+                multstart_iter = 1) 
+}
+
+#Make function for fitting  srtm using smoothed cer values
+srtm.cb.spline <- function(tacs) {
+  kinfitr::srtm(t_tac = tacs$Times, 
+                reftac = tacs$Total_cb.splinefit,
+                roitac = tacs$TAC, 
+                weights = tacs$Weights,
+                multstart_iter = 1) 
+}
+
+#Make function for fitting  srtm using smoothed cer values
+srtm.cb.spline.noise <- function(tacs) {
+  kinfitr::srtm(t_tac = tacs$Times, 
+                reftac = tacs$Total_cb.splinefit.noise,
+                roitac = tacs$TAC, 
+                weights = tacs$Weights,
+                multstart_iter = 1) 
+}
+
+
+
+#Fit 2TCM and calculate VT, VS and BPND from rate constants
+alldatLong <- alldatLong %>%  
+  mutate(fit_srtm.cb = purrr::map(tacs, srtm.cb)) %>%
+  mutate(BPND.cb = map_dbl(fit_srtm.cb, c('par', 'bp'))) %>%
+  
+  mutate(fit_srtm.cb.noise = purrr::map(tacs, srtm.cb.noise)) %>%
+  mutate(BPND.cb.noise = map_dbl(fit_srtm.cb.noise, c('par', 'bp'))) %>%
+  
+  mutate(fit_srtm.cb.spline = purrr::map(tacs, srtm.cb.spline)) %>%
+  mutate(BPND.cb.spline = map_dbl(fit_srtm.cb.spline, c('par', 'bp'))) %>%
+  
+  mutate(fit_srtm.cb.spline.noise = purrr::map(tacs, srtm.cb.spline.noise)) %>%
+  mutate(BPND.cb.spline.noise = map_dbl(fit_srtm.cb.spline.noise, c('par', 'bp'))) 
+
+ 
+
+```
+
+## Plot BPND from cerebellum v.s. BPND from cerebellum spline fit 
+
+```{r}
+
+plotData <- select(alldatLong, c(PET, Subjname, PETNo, Region, BPND.cb, BPND.cb.noise, BPND.cb.spline,BPND.cb.spline.noise ))
+
+plotDataNoNoise <- select(plotData,c( PET, Subjname, PETNo, Region,BPND.cb,BPND.cb.spline))
+plotDataNoNoiseLong <- gather(plotDataNoNoise, Condition, BPND.No.Noise, BPND.cb:BPND.cb.spline)
+
+plotDataNoNoiseLongRaw <- filter(plotDataNoNoiseLong,Condition == 'raw')
+
+#recode condition
+plotDataNoNoiseLong$Condition[plotDataNoNoiseLong$Condition == 'BPND.cb'] <- 'raw'
+plotDataNoNoiseLong$Condition[plotDataNoNoiseLong$Condition == 'BPND.cb.spline'] <- 'spline'
+
+plotDataNoise <- select(plotData,c( PET, Subjname, PETNo, Region, BPND.cb.noise, BPND.cb.spline.noise))
+plotDataNoiseLong <- gather(plotDataNoise, Condition, BPND.Noise, BPND.cb.noise:BPND.cb.spline.noise  )
+
+plotDataNoiseLongSpline <- filter(plotDataNoiseLong,Condition == 'spline')
+
+#recode condition
+plotDataNoiseLong$Condition[plotDataNoiseLong$Condition == 'BPND.cb.noise'] <- 'raw'
+plotDataNoiseLong$Condition[plotDataNoiseLong$Condition == 'BPND.cb.spline.noise'] <- 'spline'
+
+plotDataLong <- left_join(plotDataNoNoiseLong,plotDataNoiseLong)
+
+
+ggplot(data = plotDataLong, aes(x = BPND.No.Noise, y = BPND.Noise, shape = Condition, color = Condition) ) + 
+  xlab(label = 'BPND noise free')+ 
+  ylab(label = 'BPND noisy')+ 
+  geom_abline(slope = 1,intercept = 0) + 
+  geom_point()
+
+#ggsave(filename = '/Users/pontus.sigray/Desktop/BPND_raw_vs_spline_CER.png',device = 'png',width = 22.5,height = 15,units = 'cm',dpi = 350)
+
+
+ggplot(data = plotDataLong, aes(x = BPND.No.Noise, y = BPND.Noise, shape = Condition, color = Condition) ) + 
+  xlab(label = 'BPND noise free')+ 
+  ylab(label = 'BPND noisy')+ 
+  geom_abline(slope = 1,intercept = 0) + 
+  ylim(c(0,2.1)) + 
+  xlim(c(0,2.1)) + 
+  geom_point()
+
+
+
+```
+## Extra: CV-loo grid search knots and lambda 
+```{r, eval = F}
+
+tacs <- alldat$tacs[[3]]
+
+#CV.looc.gridsearch <- function(tacs){
+knot.grid <- seq(from = 5, to = 30, by = 1 )
+lamda.grid <- 0.0001 * 10^(seq(0,10,length.out = 100) )
+RSS.out <- NULL
+
+for (k in 1:length(knot.grid) ){
+
+knots = knot.grid[k]
+  
+for(i in 1:length(lamda.grid)){
+  
+  res.loo <- NULL
+  for (p in 1:length(tacs$Times)){
+    
+    loo.point <- tacs$Times[p] 
+    tacs.loo <- tacs %>%
+      filter(Times != loo.point)
+    
+    gam.fit <- mgcv::gam(formula = (Total_cb.noise ~ s(Times , bs = 'cr', k = knots)),
+                         sp= lamda.grid[i] ,
+                           data = tacs.loo)
+    
+    res.loo[p] <- tacs$Total_cb.noise[p] - predict(gam.fit,newdata = tibble(Times = loo.point) )
+    
+    
+  }
+  
+  RSS[i] <- sum(res.loo^2)
+}
+
+RSS.out <- cbind(RSS.out,RSS)
+print(k)
+}
+
+
+rownames(RSS.out) <- paste0('lambda_',lamda.grid)
+colnames(RSS.out) <- paste0('knot_',knot.grid)
+
+heatmap(log(RSS.out),  Colv=NA, Rowv=NA, scale='none')
+RSS.min.idx <- which(RSS.out == min(RSS.out), arr.ind = TRUE)
+
+out <- list(RSS.min.idx = RSS.min.idx)
+#}
+
+
+sp <- 0.5
+knots <-8
+
+
+gam.fit <- mgcv::gam(formula = (Total_cb.noise ~ s(Times , bs = 'cr', k = knots)),sp = sp,
+                     data = tacs)
+
+
+#lambda <- gam.fit$sp; lambda
+#length(gam.fit$smooth[[1]]$xp)
+tacs$Total_cb.splinefit.noise <- as.numeric(predict(gam.fit))
+tacs$Total_cb.splinefit.noise[1] <- 0
+plot(tacs$Times,tacs$Total_cb.noise, xlim = c(0,5), ylim = c(0,14) )
+points(tacs$Times,tacs$Total_cb.splinefit.noise,type = 'l')
+points(tacs$Times,tacs$Total_cb.splinefit.noise,col = 'blue')
+
+points(tacs$Times,tacs$Total_cb,col = 'red')
+
+
+abline(v = gam.fit$smooth[[1]]$xp, type = 2)
+
+##fit and compare
+
+
+spline.fit.noise <- kinfitr::srtm(t_tac = tacs$Times,reftac = tacs$Total_cb.splinefit.noise,roitac = tacs$Frontal.Cortex,weights = tacs$Weights)
+
+raw.fit <- kinfitr::srtm(t_tac = tacs$Times,reftac = tacs$Total_cb,roitac = tacs$Frontal.Cortex,weights = tacs$Weights)
+
+raw.fit.noise <- kinfitr::srtm(t_tac = tacs$Times,reftac = tacs$Total_cb.noise,roitac = tacs$Frontal.Cortex,weights = tacs$Weights)
+
+raw.fit$par$bp
+raw.fit.noise$par$bp
+spline.fit.noise$par$bp
+
+```
+

@@ -1,0 +1,429 @@
+---
+title: "How to determine regression spline knots and lambda for PET data?"
+output:
+  html_document:
+    df_print: paged
+---
+
+
+```{r setup, echo=F, warning=F,message=F} 
+
+knitr::opts_chunk$set(echo = FALSE) #'echo = False' hides *all* code chunks below when knitted 
+knitr::opts_chunk$set(warning = FALSE) #'warning = F' hides *all* warnings messages below when knitted 
+knitr::opts_chunk$set(message = FALSE) #'message = F' hides *all* messages below when knitted 
+
+#set path to the parent folder of the project
+knitr::opts_knit$set(root.dir = normalizePath("/Users/pontus.sigray/Github/spline_stuff/"))
+
+#load packages (install from CRAN unless otherwise specified)
+library(kinfitr) #devtools::install_github('mathesong/kinfitr')
+library(tidyverse)
+library(knitr)
+library(kableExtra)
+library(mgcv)
+library(ggplot2)
+
+
+#Graphics theme
+theme_set(theme_light())
+
+
+```
+
+
+# Simple case 
+
+Let's simulate some sinus data and add gaussian noise. 
+
+```{r}
+
+
+### Equation: y=a*sin(b*t)+c.unif*amp
+# variables
+n <- 100 # number of data points
+t <- seq(0,4*pi,,100)
+a <- 3
+b <- 2
+c.norm <- rnorm(n,mean = 0,sd = 1)
+amp <- 2
+
+# generate data and calculate "y"
+set.seed(2)
+y.even <- a*sin(b*t)+c.norm*amp # Gaussian/normal error
+
+dat <- tibble(y.even = y.even, t = t)
+plot(t, y.even, ylim = c(-10,10) ,  xlab = 'time',ylab = 'y' )
+plot(function(t) a*sin(b*t),add = T, xlim = c(0,max(t)))
+legend("top", legend=c("true"), col=c("black") , lty=1, bty="n", cex = 0.8)
+
+```
+
+Let's fit a cubic regression spline using the maximum possible number of knots, and determine lambda by leave-one-out cross-validation (loo-CV) (this is build into the R-package function used below).  
+
+```{r}
+
+fit <- mgcv::gam(data = dat,formula = (y.even ~ s(t,bs = 'cr', k = length(t) )))
+dat$fit.pred <- as.numeric(predict(fit))
+
+# plot results
+plot(t, y.even, ylim = c(-10,10) ,  xlab = 'time',ylab = 'y' )
+plot(function(t) a*sin(b*t),add = T, xlim = c(0,max(t)))
+
+points(dat$t,dat$fit.pred,type = 'l',col = 'blue') 
+legend("top", legend=c("true","spline with max knots"), col=c("black","blue") , lty=1, bty="n", cex = 0.8)
+
+```
+
+Looks amazingly good. This method works! Or does it...? 
+
+Let's read in a time-activity-curve, simulate some noise and smooth that. 
+
+
+```{r}
+
+dat <- readRDS(file = './DerivedData/cimbi36_reftac.rds')
+
+set.seed(10)
+dat$y.noise <- dat$y + rnorm(length(dat$y), 0,1) 
+dat$y.noise[1] <- 0 
+
+
+plot(dat$t,dat$y, t = 'l', ylim = c(0,15), xlab = 'time', ylab = 'tac' )
+points(dat$t,dat$y.noise)
+legend("top", legend=c("true tac"), col=c("black") , lty=1, bty="n", cex = 0.8)
+
+
+```
+
+We fit it with a cubic spline using the maximum possible number of knots and loo-CV search for the lambda. 
+
+```{r}
+
+fit <- mgcv::gam(data = dat,formula = (y.noise ~ s(t,bs = 'cr',k = 30) ) )
+
+lambda.overfit <- as.numeric(fit$sp )
+dat$pred <- as.numeric(predict(fit))
+
+
+plot(dat$t,dat$y, t = 'l', ylim = c(0,15), xlab = 'time', ylab = 'tac' )
+points(dat$t,dat$y.noise)
+points(dat$t, dat$pred, type = 'l', col = 'blue')
+legend(x = 55,y = 14, legend=c("true", "spline with max knots and CV lambda"), col=c("black","blue"), lty=1, bty="n", cex = 0.85)
+```
+
+Ohf. That does not look good. Lambda is `r round(lambda.overfit)` here, but clearly that is not enough. Let's manually ramp it up.  
+
+```{r}
+
+
+fit <- mgcv::gam(data = dat,formula = (y.noise ~ s(t,bs = 'cr',k = 30) ), sp = 1e6)
+
+dat$pred <- as.numeric(predict(fit))
+
+plot(dat$t,dat$y, t = 'l', ylim = c(0,15), xlab = 'time', ylab = 'tac' )
+points(dat$t,dat$y.noise)
+points(dat$t, dat$pred, type = 'l', col = 'blue')
+legend(x = 55,y = 14, legend=c("true", "spline with max knots"), col=c("black","blue"), lty=1, bty="n", cex = 0.85)
+
+```
+
+That looks better, but the spline clearly cannot "reach down" to the first data-point (0). We sacrificed a good fit in the beginning to fix the overfitting of the flatter part of the data. 
+
+But hold your horses, we might have bought the pig in the sack, to use a moralizing Swedish expression!  Could it be that the build-in function in the package we been using sucks? Let's set up a manual loo-CV search ourselves: 
+
+
+```{r, eval = F}
+
+### CV-looc grid search
+
+#CV.looc.gridsearch <- function(dat){
+knot.grid <- seq(from = 5, to = 30, by = 1 )
+lamda.grid <- 0.0001 * 10^(seq(0,10,length.out = 100) )
+RSS.out <- NULL
+
+for (k in 1:length(knot.grid) ){
+  
+  knots = knot.grid[k]
+  RSS <- NULL
+  for(i in 1:length(lamda.grid)){
+    
+    res.loo <- NULL
+    for (p in 1:length(dat$t)){
+      
+      loo.point <- dat$t[p] 
+      dat.loo <- dat %>%
+        filter(t != loo.point)
+      
+      gam.fit <- mgcv::gam(formula = (y.noise ~ s(t , bs = 'cr', k = knots)),
+                           sp= lamda.grid[i] ,
+                           data = dat.loo)
+      
+      res.loo[p] <- dat$y.noise[p] - predict(gam.fit,newdata = tibble(t = loo.point) )
+      
+      
+    }
+    
+    RSS[i] <- sum(res.loo^2)
+  }
+  
+  RSS.out <- cbind(RSS.out,RSS)
+  print(k)
+}
+
+
+rownames(RSS.out) <- paste0('lambda_',lamda.grid)
+colnames(RSS.out) <- paste0('knot_',knot.grid)
+
+saveRDS(object = RSS.out, file = './DerivedData/RSS_for_heatmap.rds')
+
+```
+
+And let's plot the CV-curve for lambda using the maximum possible number of knots. 
+
+```{r}
+lamda.grid <- 0.0001 * 10^(seq(0,10,length.out = 100) )
+knot.grid <- seq(from = 5, to = 30, by = 1 )
+
+RSS.out <- readRDS(file = './DerivedData/RSS_for_heatmap.rds')
+plot( log(lamda.grid), as.numeric(RSS.out[,26]), ylab = 'loo-RSS', xlab = 'log lambda')
+lambda.knot30 <- lamda.grid[which.min(as.numeric(RSS.out[,26]))]
+
+```
+
+My own grid search suggests a lambda of `r round(lambda.knot30)` for the maximum number of knots. Not sure why this differs so much from the approximate solution suggested by the build-in function in the R package I used. It might be that the packages uses REML instead of GCV, and that could explain the difference. 
+
+Anyways,  it still doesn't solve our problem: since a the build-in function suggested a lambda of `r  round(lambda.overfit)` and this produced a rather horrible overfitting, I doubt mine is gonna be better. 
+
+# Solution! 
+
+Shame on the quitter, to use another moralizing swedish expression! Instead, let's look at what happens if I loo-CV search across both the number of knots and lambda:  
+
+```{r}
+heatmap(log(log(RSS.out)),  Colv=NA, Rowv=NA, scale='none')
+
+```
+
+The heatmap shows the number of knots and different lambdas and their respective (logged) loo-RSS values, were whiter values means lower RSS, and redder values means higher RSS. Here we can clearly see that for the maximum possible number of knots (k = 30) there will never be a lambda which gives us lower RSS, compared to selecting only 10-12 knots and a low lambda. 
+
+```{r}
+RSS.min.idx <- which(RSS.out == min(RSS.out), arr.ind = TRUE)
+sp <- lamda.grid[RSS.min.idx[1]]
+knots <- knot.grid[ RSS.min.idx[2] ]
+```
+
+
+Let's plot the spline using the settings suggested by heatmap above (lambda = `r round(sp)` and nbr of knots =  `r knots`). 
+
+```{r}
+#get the CV-loo knot and lambda spline
+gam.fit <- mgcv::gam(formula = (y.noise ~ s(t , bs = 'cr', k = knots)),
+                     sp= sp,
+                     data = dat)
+
+
+#get the CV-loo on lambda at max knot spline
+gam.fit.maxknots <- mgcv::gam(formula = (y.noise ~ s(t , bs = 'cr', k = 30)),
+                     data = dat)
+
+plot(dat$t,dat$y, type = 'l', ylim = c(0,14),xlab = 'time',ylab = 'tac'  )
+points(dat$t,predict(gam.fit.maxknots), type = 'l' , col = 'blue')
+points(dat$t,predict(gam.fit), type = 'l' , col = 'red')
+points(dat$t,dat$y.noise, col = 'grey')
+
+legend(x = 55,y = 14, legend=c("true","spline CV knots and lambda", "spline with max knots and CV lambda"), col=c("black",'red',"blue"), lty=1, bty="n", cex = 0.85)
+
+dat.save <- dat
+dat.save$pred.optimal <- predict(gam.fit)
+knot.placement.optimal <- gam.fit$smooth[[1]]$xp
+knot.placement.30knots <- gam.fit.maxknots$smooth[[1]]$xp
+```
+
+
+It looks pretty clear to me that the grid search across both knots and lambda was needed to produce a sensible "recovery" of the original true underlying tac. 
+
+# But why? 
+
+What's going on here? *How come simulated sinus data works fine, and PET data does not?* First of all, PET data is unevenly spaced. But that doesn't seem to explain the issue above (although it might exaggerate it a bit?).
+
+Instead let's have a look at what happens when we use a tac which has a *very* rapid influx, and then keep a more stable shape for the duration of the scan. 
+
+```{r}
+
+dat <- readRDS(file = './DerivedData/cimbi36_reftac_rapidInflux.rds')
+
+set.seed(2)
+dat$y.noise <- dat$y + rnorm(length(dat$y),0,1) 
+dat$y.noise[1] <- 0
+
+plot(dat$t,dat$y, type = 'l')
+points(dat$t,dat$y.noise)
+legend("top", legend=c("true"), col=c("black") , lty=1, bty="n", cex = 0.8)
+
+
+```
+
+Let's look at the fit with a max knot and search for lambda. 
+
+```{r}
+
+
+#get the CV-loo on lambda at max knot spline
+gam.fit.maxknots <- mgcv::gam(formula = (y.noise ~ s(t , bs = 'cr', k = 30)),
+                     data = dat)
+
+plot(dat$t,dat$y, type = 'l', ylim = c(0,25),xlab = 'time',ylab = 'tac'  )
+#points(dat$t,predict(gam.fit), type = 'l' , col = 'red')
+points(dat$t,predict(gam.fit.maxknots), type = 'l' , col = 'blue')
+points(dat$t,dat$y.noise, col = 'grey')
+legend(x = 65,y = 24, legend=c("true", "spline build-in fun max knots"), col=c("black","blue"), lty=1, bty="n", cex = 0.75)
+
+```
+
+Horrible. But let's remove the first dot. 
+
+```{r}
+
+
+dat.exl <- dplyr::filter(dat, t != 0)
+
+#get the CV-loo on lambda at max knot spline
+gam.fit.maxknots <- mgcv::gam(formula = (y.noise ~ s(t , bs = 'cr', k = 30)),
+                     data = dat.exl)
+
+plot(dat$t,dat$y, type = 'l', ylim = c(0,25),xlab = 'time',ylab = 'tac'  )
+#points(dat$t,predict(gam.fit), type = 'l' , col = 'red')
+points(dat.exl$t,predict(gam.fit.maxknots), type = 'l' , col = 'blue')
+points(dat$t,dat$y.noise, col = 'grey')
+legend(x = 65,y = 24, legend=c("true", "spline build-in fun max knots"), col=c("black","blue"), lty=1, bty="n", cex = 0.75)
+
+```
+
+Nice, now it works. But let me do my double-grid search again, looking for both knots and lambda using loo-CV while still excluding the first data point.  
+
+```{r, eval = F}
+
+### CV-looc grid search
+
+#CV.looc.gridsearch <- function(dat){
+knot.grid <- seq(from = 5, to = 30, by = 1 )
+lamda.grid <- 0.0001 * 10^(seq(0,10,length.out = 100) )
+RSS.out <- NULL
+
+for (k in 1:length(knot.grid) ){
+  
+  knots = knot.grid[k]
+  RSS <- NULL
+  for(i in 1:length(lamda.grid)){
+    
+    res.loo <- NULL
+    for (p in 1:length(dat.exl$t)){
+      
+      loo.point <- dat.exl$t[p] 
+      dat.loo <- dat.exl %>%
+        filter(t != loo.point)
+      
+      gam.fit <- mgcv::gam(formula = (y.noise ~ s(t , bs = 'cr', k = knots)),
+                           sp= lamda.grid[i] ,
+                           data = dat.loo)
+      
+      res.loo[p] <- dat.exl$y.noise[p] - predict(gam.fit,newdata = tibble(t = loo.point) )
+      
+      
+    }
+    
+    RSS[i] <- sum(res.loo^2)
+  }
+  
+  RSS.out <- cbind(RSS.out,RSS)
+  print(k)
+}
+
+
+rownames(RSS.out) <- paste0('lambda_',lamda.grid)
+colnames(RSS.out) <- paste0('knot_',knot.grid)
+
+saveRDS(object = RSS.out, file = './DerivedData/RSS_for_heatmap_rapidInflux.rds')
+```
+
+```{r}
+
+RSS.out <-readRDS(file = './DerivedData/RSS_for_heatmap_rapidInflux.rds')
+heatmap(log(log(RSS.out)),  Colv=NA, Rowv=NA, scale='none')
+
+RSS.min.idx <- which(RSS.out == min(RSS.out), arr.ind = TRUE)
+sp <- lamda.grid[RSS.min.idx[1]]
+knots <- knot.grid[ RSS.min.idx[2] ]
+
+```
+
+For *this* dataset, a high number of knots and than a cranking up of lambda seem to produce very good fits, according to loo-CV. Let's look at the results when fitting cubic spline using the settings suggested by the heatmap (nbr knots = `r knots` and lambda = `r round(sp)`). 
+
+```{r}
+
+#get the CV-loo knot and lambda spline
+gam.fit <- mgcv::gam(formula = (y.noise ~ s(t , bs = 'cr', k = knots)),
+                     sp= sp,
+                     data = dat.exl)
+
+#get the CV-loo on lambda at max knot spline
+gam.fit.maxknots <- mgcv::gam(formula = (y.noise ~ s(t , bs = 'cr', k = 30)),
+                     data = dat.exl)
+
+plot(dat$t,dat$y, type = 'l', ylim = c(0,25),xlab = 'time',ylab = 'tac'  )
+points(dat.exl$t,predict(gam.fit), type = 'l' , col = 'red')
+points(dat.exl$t,predict(gam.fit.maxknots), type = 'l' , col = 'blue')
+points(dat$t,dat$y.noise, col = 'grey')
+legend(x = 65,y = 24, legend=c("true","spline CV knots and lambda", "spline build-in fun max knots"), col=c("black",'red',"blue"), lty=1, bty="n", cex = 0.75)
+
+
+```
+
+Now the build in package using max number of knots, and my grid-search over both knots and lambda produces close to identical results.
+
+
+## Conclusions? 
+
+- When we have a lot of steeply changing data in the beginning, and then a less of change after the peak - maybe a high number of knots and a "tightening" of lambda just don't work very well. It will tend to overfit the part that do not change much in order to accommodate the part that does change a lot.
+
+- When also taking account an "optimal" number of knots (distributed according to the data's quantiles, i.e. more of them in the beginning, and fewer later on in the scan), then a better balance between under/overfitting is found. 
+
+```{r, fig.height=8.5}
+
+par(mfrow = c(2,1) )
+
+plot(dat.save$t,dat.save$y.noise, xlab = 'time', ylab = 'tac')
+points(dat.save$t,dat.save$y, type = 'l')
+points(dat.save$t,dat.save$pred.optimal, type = 'l',col = 'red')
+abline(v = knot.placement.optimal, lty = 2)
+
+plot(dat.save$t,dat.save$y.noise, xlab = 'time', ylab = 'tac')
+points(dat.save$t,dat.save$y, type = 'l')
+points(dat.save$t,dat.save$pred, type = 'l',col = 'blue')
+abline(v = knot.placement.30knots, lty = 2)
+
+```
+
+
+**NB: I observe the same issues with when fitting a spline to the arterial input data as well.** 
+
+##Conclusions from talking to Todd
+
+Yes, we need to do CGV search for both lambda and knot settings on these particular datasets (TACs, plasma and blood curves). The sampling frequency is uneven and the data has very different smoothness across time:  knot selection becomes important. 
+
+(Natural) cubic splines with knot placement according to data quantile is recommended. GCV search for lambda AND number of knots. Knot selection can likley be determined on group level, while lambda could likely be adapted to individual data curves. Plot the data and smoothing and do visual checks. 
+
+## Additional points to consider: 
+
+1. The un-even sample frequency of PET data (more points in the beginning and few points towards the end) might make this issue even worse. This could be true for TACs and blood alike. 
+
+2. Ideally, the spline regression should use the same weighting scheme as when we apply the nls compartmental fit? 
+
+3. Can we force the spline to start at zero? 
+
+4. Should we consider monotonicity constrains (spline regression weight must be positive up until peak, then must be negative)? 
+
+
+
+
+
+
